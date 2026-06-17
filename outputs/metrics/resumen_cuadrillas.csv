@@ -1,0 +1,5 @@
+﻿cuadrilla_id,cantidad_transformadores,prioridad_minima,ventana_minima_horas,distancia_total_estimada_km,temperatura_promedio,carga_promedio,Mantenimiento urgente
+Cuadrilla 1,7,1,24,26.59,36.4,0.86,7
+Cuadrilla 2,18,1,24,59.03,37.6,1.144,18
+Cuadrilla 3,17,1,24,40.47,37.7,1.082,17
+Cuadrilla 4,18,1,24,33.93,37.1,1.3,18
