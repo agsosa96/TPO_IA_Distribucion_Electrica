@@ -22,12 +22,15 @@ import plotly.express as px
 import streamlit as st
 from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
+import joblib
 
 
 TRANSFORMADORES_PATH = Path("data/processed/transformadores_con_recomendaciones.csv")
 PLAN_CUADRILLAS_PATH = Path("data/processed/plan_cuadrillas.csv")
 RESUMEN_CUADRILLAS_PATH = Path("outputs/metrics/resumen_cuadrillas.csv")
 RESUMEN_RECOMENDACIONES_PATH = Path("outputs/metrics/resumen_recomendaciones.csv")
+MODELO_PATH = Path("models/modelo_riesgo_transformadores.joblib")
+IMPORTANCIA_VARIABLES_PATH = Path("outputs/metrics/importancia_variables.csv")
 
 
 st.set_page_config(
@@ -40,6 +43,11 @@ st.set_page_config(
 @st.cache_data
 def cargar_csv(path: Path) -> pd.DataFrame:
     return pd.read_csv(path)
+
+
+@st.cache_resource
+def cargar_modelo(path: Path) -> dict:
+    return joblib.load(path)
 
 
 def validar_archivos() -> None:
@@ -446,6 +454,386 @@ def mostrar_resumen_cuadrillas() -> None:
     )
 
 
+def recomendar_accion_simulada(
+    riesgo: str,
+    temperatura: float,
+    porcentaje_carga: float,
+    dias_mantenimiento: int,
+    fallas: int,
+) -> dict:
+    motivos = []
+
+    if riesgo == "Alto":
+        prioridad = 1
+        accion = "Mantenimiento urgente"
+        ventana_horas = 24
+        tipo_intervencion = "Inspección térmica y revisión de carga"
+
+        motivos.append("riesgo alto predicho por el modelo")
+
+        if temperatura >= 36:
+            motivos.append("temperatura elevada")
+        if porcentaje_carga >= 0.90:
+            motivos.append("carga cercana o superior al límite operativo")
+        if dias_mantenimiento >= 300:
+            motivos.append("muchos días desde el último mantenimiento")
+        if fallas >= 2:
+            motivos.append("historial reciente de fallas")
+
+    elif riesgo == "Medio":
+        if porcentaje_carga >= 0.85 or temperatura >= 35 or dias_mantenimiento >= 300:
+            prioridad = 2
+            accion = "Inspección prioritaria"
+            ventana_horas = 72
+            tipo_intervencion = "Revisión preventiva en campo"
+        else:
+            prioridad = 3
+            accion = "Revisión programada"
+            ventana_horas = 168
+            tipo_intervencion = "Control preventivo"
+
+        motivos.append("riesgo medio predicho por el modelo")
+
+        if temperatura >= 35:
+            motivos.append("temperatura moderadamente elevada")
+        if porcentaje_carga >= 0.75:
+            motivos.append("nivel de carga relevante")
+        if dias_mantenimiento >= 240:
+            motivos.append("mantenimiento próximo a vencer")
+        if fallas >= 1:
+            motivos.append("registro de fallas recientes")
+
+    else:
+        prioridad = 4
+        accion = "Monitoreo normal"
+        ventana_horas = 720
+        tipo_intervencion = "Seguimiento operativo"
+
+        motivos.append("riesgo bajo predicho por el modelo")
+
+        if temperatura >= 35 or porcentaje_carga >= 0.80:
+            accion = "Monitoreo reforzado"
+            prioridad = 3
+            ventana_horas = 168
+            motivos.append("variable operativa en observación")
+
+    return {
+        "accion": accion,
+        "prioridad": prioridad,
+        "ventana_horas": ventana_horas,
+        "tipo_intervencion": tipo_intervencion,
+        "motivo": "; ".join(motivos),
+    }
+
+
+def predecir_escenario_what_if(row_simulada: pd.Series) -> dict:
+    if not MODELO_PATH.exists():
+        raise FileNotFoundError(
+            "No se encontró el modelo entrenado. Ejecutá primero: python src/entrenar_modelo.py"
+        )
+
+    artefacto = cargar_modelo(MODELO_PATH)
+
+    pipeline = artefacto["pipeline"]
+    numeric_features = artefacto["numeric_features"]
+    categorical_features = artefacto["categorical_features"]
+
+    features = numeric_features + categorical_features
+
+    x_simulado = pd.DataFrame([row_simulada[features].to_dict()])
+
+    riesgo_predicho = pipeline.predict(x_simulado)[0]
+    probabilidades = pipeline.predict_proba(x_simulado)[0]
+    clases = pipeline.named_steps["model"].classes_
+
+    probabilidad_maxima = float(probabilidades.max())
+
+    probabilidades_dict = {
+        f"probabilidad_{clase.lower()}": round(float(prob), 4)
+        for clase, prob in zip(clases, probabilidades)
+    }
+
+    return {
+        "riesgo_predicho": riesgo_predicho,
+        "probabilidad_maxima": round(probabilidad_maxima, 4),
+        **probabilidades_dict,
+    }
+
+
+def mostrar_simulador_what_if(df: pd.DataFrame, riesgo_col: str) -> None:
+    st.subheader("Simulador What-if")
+
+    st.write(
+        "Este simulador permite modificar variables operativas de un transformador "
+        "y volver a ejecutar el modelo para ver cómo cambiaría el riesgo."
+    )
+
+    if not MODELO_PATH.exists():
+        st.error("No se encontró el modelo entrenado.")
+        st.code("python src/entrenar_modelo.py")
+        return
+
+    ids = df["transformador_id"].dropna().astype(str).tolist()
+
+    transformador_sel = st.selectbox(
+        "Seleccionar transformador para simular",
+        options=ids,
+        key="what_if_transformador",
+    )
+
+    row_original = df[df["transformador_id"].astype(str) == transformador_sel].iloc[0].copy()
+
+    st.write("### Valores originales")
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    col1.metric("Riesgo actual", row_original[riesgo_col])
+    col2.metric("Temperatura", f"{float(row_original['temperatura_actual']):.1f} °C")
+    col3.metric("Carga", f"{float(row_original['porcentaje_carga']):.2f}")
+    col4.metric("Días sin mantenimiento", int(row_original["dias_desde_mantenimiento"]))
+
+    st.write("### Modificar escenario")
+
+    temperatura_max = max(45.0, float(df["temperatura_actual"].max()) + 2)
+    carga_max = max(2.5, float(df["porcentaje_carga"].max()) + 0.2)
+    dias_max = max(800, int(df["dias_desde_mantenimiento"].max()) + 30)
+
+    col_temp, col_carga, col_mant = st.columns(3)
+
+    temperatura_simulada = col_temp.slider(
+        "Temperatura simulada °C",
+        min_value=15.0,
+        max_value=float(temperatura_max),
+        value=float(row_original["temperatura_actual"]),
+        step=0.5,
+    )
+
+    carga_simulada = col_carga.slider(
+        "Porcentaje de carga simulado",
+        min_value=0.10,
+        max_value=float(carga_max),
+        value=float(row_original["porcentaje_carga"]),
+        step=0.05,
+    )
+
+    dias_simulados = col_mant.slider(
+        "Días desde mantenimiento simulados",
+        min_value=0,
+        max_value=int(dias_max),
+        value=int(row_original["dias_desde_mantenimiento"]),
+        step=10,
+    )
+
+    row_simulada = row_original.copy()
+
+    row_simulada["temperatura_actual"] = temperatura_simulada
+    row_simulada["porcentaje_carga"] = carga_simulada
+    row_simulada["dias_desde_mantenimiento"] = dias_simulados
+
+    if "capacidad_kva" in row_simulada.index and pd.notna(row_simulada["capacidad_kva"]):
+        row_simulada["carga_estimada_kw"] = (
+            carga_simulada * float(row_simulada["capacidad_kva"]) * 0.92
+        )
+
+    if st.button("Ejecutar simulación", type="primary"):
+        resultado = predecir_escenario_what_if(row_simulada)
+
+        fallas = int(row_simulada.get("fallas_ultimos_12_meses", 0))
+
+        recomendacion = recomendar_accion_simulada(
+            riesgo=resultado["riesgo_predicho"],
+            temperatura=temperatura_simulada,
+            porcentaje_carga=carga_simulada,
+            dias_mantenimiento=dias_simulados,
+            fallas=fallas,
+        )
+
+        st.write("### Resultado simulado")
+
+        col_a, col_b, col_c, col_d = st.columns(4)
+
+        col_a.metric(
+            "Riesgo original",
+            row_original[riesgo_col],
+        )
+
+        col_b.metric(
+            "Riesgo simulado",
+            resultado["riesgo_predicho"],
+        )
+
+        col_c.metric(
+            "Probabilidad máxima",
+            f"{resultado['probabilidad_maxima'] * 100:.1f}%",
+        )
+
+        col_d.metric(
+            "Prioridad simulada",
+            recomendacion["prioridad"],
+        )
+
+        if str(row_original[riesgo_col]) != str(resultado["riesgo_predicho"]):
+            st.warning(
+                f"El escenario cambia el riesgo de {row_original[riesgo_col]} "
+                f"a {resultado['riesgo_predicho']}."
+            )
+        else:
+            st.success("El escenario no modifica la clase de riesgo predicha.")
+
+        st.write("### Recomendación del agente")
+
+        st.info(
+            f"""
+            **Acción recomendada:** {recomendacion["accion"]}
+
+            **Tipo de intervención:** {recomendacion["tipo_intervencion"]}
+
+            **Ventana de atención:** {recomendacion["ventana_horas"]} horas
+
+            **Motivo:** {recomendacion["motivo"]}
+            """.strip()
+        )
+
+        st.write("### Probabilidades por clase")
+
+        probs_mostrar = {
+            key.replace("probabilidad_", "").capitalize(): value
+            for key, value in resultado.items()
+            if key.startswith("probabilidad_")
+        }
+
+        probs_df = pd.DataFrame(
+            {
+                "riesgo": list(probs_mostrar.keys()),
+                "probabilidad": list(probs_mostrar.values()),
+            }
+        )
+
+        fig = px.bar(
+            probs_df,
+            x="riesgo",
+            y="probabilidad",
+            text="probabilidad",
+            title="Probabilidad estimada por clase de riesgo",
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.write("### Comparación de variables")
+
+        comparacion = pd.DataFrame(
+            {
+                "variable": [
+                    "temperatura_actual",
+                    "porcentaje_carga",
+                    "dias_desde_mantenimiento",
+                    "carga_estimada_kw",
+                ],
+                "valor_original": [
+                    row_original.get("temperatura_actual"),
+                    row_original.get("porcentaje_carga"),
+                    row_original.get("dias_desde_mantenimiento"),
+                    row_original.get("carga_estimada_kw"),
+                ],
+                "valor_simulado": [
+                    row_simulada.get("temperatura_actual"),
+                    row_simulada.get("porcentaje_carga"),
+                    row_simulada.get("dias_desde_mantenimiento"),
+                    row_simulada.get("carga_estimada_kw"),
+                ],
+            }
+        )
+
+        st.dataframe(comparacion, use_container_width=True, hide_index=True)
+
+
+def mostrar_explicabilidad_modelo() -> None:
+    st.subheader("Explicabilidad del modelo")
+
+    st.write(
+        "Esta sección muestra qué variables tuvieron mayor peso en el modelo "
+        "Random Forest al momento de clasificar el riesgo de los transformadores."
+    )
+
+    if not IMPORTANCIA_VARIABLES_PATH.exists():
+        st.warning("No se encontró el archivo de importancia de variables.")
+        st.write("Ejecutá nuevamente el entrenamiento del modelo:")
+        st.code("python src/entrenar_modelo.py")
+        return
+
+    importancia = cargar_csv(IMPORTANCIA_VARIABLES_PATH)
+
+    columnas_necesarias = {"variable", "importancia"}
+
+    if not columnas_necesarias.issubset(importancia.columns):
+        st.error(
+            "El archivo importancia_variables.csv no tiene el formato esperado. "
+            "Debe contener las columnas 'variable' e 'importancia'."
+        )
+        return
+
+    importancia = importancia.sort_values("importancia", ascending=False).copy()
+
+    top_n = st.slider(
+        "Cantidad de variables a mostrar",
+        min_value=5,
+        max_value=min(20, len(importancia)),
+        value=min(10, len(importancia)),
+    )
+
+    top_importancia = importancia.head(top_n).copy()
+
+    fig = px.bar(
+        top_importancia.sort_values("importancia", ascending=True),
+        x="importancia",
+        y="variable",
+        orientation="h",
+        text="importancia",
+        title="Variables más importantes del modelo",
+    )
+
+    fig.update_traces(texttemplate="%{text:.3f}")
+    fig.update_layout(yaxis_title="Variable", xaxis_title="Importancia")
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.write("### Tabla de importancia")
+
+    st.dataframe(
+        importancia,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.write("### Cómo interpretar este gráfico")
+
+    st.info(
+        """
+        Las variables con mayor importancia son las que más ayudaron al modelo a separar
+        los casos de riesgo Bajo, Medio y Alto.
+
+        Por ejemplo, si `porcentaje_carga`, `temperatura_actual` o
+        `dias_desde_mantenimiento` aparecen arriba, significa que el modelo las usó con
+        más peso para decidir el nivel de riesgo.
+
+        Esto permite explicar que el modelo no funciona como una caja negra completa:
+        podemos observar qué factores técnicos influyen más en la clasificación.
+        """.strip()
+    )
+
+    st.write("### Lectura técnica para la exposición")
+
+    st.success(
+        """
+        El modelo Random Forest no solo genera una predicción, sino que también permite
+        analizar la contribución relativa de cada variable. Esto nos ayuda a validar si
+        el comportamiento del modelo tiene sentido operativo: un transformador con alta
+        carga, alta temperatura, muchos días sin mantenimiento o fallas recientes debería
+        tener mayor probabilidad de ser clasificado como crítico.
+        """.strip()
+    )
+
+
 def main() -> None:
     validar_archivos()
 
@@ -466,14 +854,18 @@ def main() -> None:
 
     st.divider()
 
-    tab1, tab2, tab3, tab4 = st.tabs(
+
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
         [
-            "Mapa de riesgo",
-            "Análisis y recomendaciones",
-            "Plan de cuadrillas",
-            "Detalle individual",
+        "Mapa de riesgo",
+        "Análisis y recomendaciones",
+        "Plan de cuadrillas",
+        "Detalle individual",
+        "Simulador What-if",
+        "Explicabilidad",
         ]
     )
+
 
     with tab1:
         st.subheader("Mapa de transformadores")
@@ -531,6 +923,11 @@ def main() -> None:
     with tab4:
         mostrar_detalle_transformador(df, riesgo_col)
 
+    with tab5:
+        mostrar_simulador_what_if(df, riesgo_col)
+
+    with tab6:
+        mostrar_explicabilidad_modelo()
 
 if __name__ == "__main__":
     main()
